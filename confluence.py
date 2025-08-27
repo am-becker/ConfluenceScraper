@@ -961,7 +961,12 @@ def build_graph_and_titles():
     while queue:
         cur = queue.pop(0)
         if cur in visited_ids:
+            # show progress even if already visited (rare)
+            total_now = len(visited_ids) + len(queue)
+            pct = (len(visited_ids) / total_now * 100) if total_now else 100.0
+            print(f"[Crawl] Progress: {pct:.1f}% ({len(visited_ids)}/{total_now} discovered)")
             continue
+
         visited_ids.add(cur)
         node = GRAPH.nodes[cur]
         href = next(iter(node.hrefs)) if node.hrefs else f"{BASE_URL}/pages/viewpage.action?pageId={cur}"
@@ -1003,6 +1008,12 @@ def build_graph_and_titles():
                 except Exception:
                     pass
 
+
+        # ---- progress after every page visit ----
+        total_now = len(visited_ids) + len(queue)
+        pct = (len(visited_ids) / total_now * 100) if total_now else 100.0
+        print(f"[Crawl] Progress: {pct:.1f}% ({len(visited_ids)}/{total_now} discovered)")
+
     # Slugs
     for nid, n in GRAPH.nodes.items():
         if not n.title:
@@ -1020,9 +1031,16 @@ def build_graph_and_titles():
             used.add(slug.lower())
 
 def materialize_folders() -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Create folders for every page but *omit* the root ("Home") directory level.
+    - Root page: folder = ROOT_DIR, html = ROOT_DIR/<root-slug>.html
+    - Children of root: folder = ROOT_DIR/<child>/..., html inside that folder
+    """
     id_to_folder: Dict[str, str] = {}
     id_to_path_html: Dict[str, str] = {}
+
     def path_components(nid: str) -> List[str]:
+        # Build components from root -> nid
         comps = []
         cur = nid
         while cur is not None:
@@ -1030,14 +1048,30 @@ def materialize_folders() -> Tuple[Dict[str, str], Dict[str, str]]:
             comps.append(node.slug or f"page-{cur}")
             cur = node.parent_id
         comps.reverse()
+        # Drop the root ("Home") component if present
+        if comps:
+            comps = comps[1:]
         return comps
+
     for nid in GRAPH.all_ids():
         comps = path_components(nid)
-        folder = os.path.join(ROOT_DIR, *comps)
+
+        # Root page sits directly under ROOT_DIR
+        if GRAPH.root_id and nid == GRAPH.root_id:
+            folder = ROOT_DIR
+        else:
+            folder = os.path.join(ROOT_DIR, *comps) if comps else ROOT_DIR
+
         ensure_dir(folder)
         id_to_folder[nid] = folder
-        id_to_path_html[nid] = os.path.join(folder, f"{GRAPH.nodes[nid].slug}.html")
+
+        # Keep filename as <slug>.html (root becomes ROOT_DIR/<root-slug>.html)
+        html_name = f"{GRAPH.nodes[nid].slug}.html"
+        id_to_path_html[nid] = os.path.join(folder, html_name)
+
+        # Per-page assets folder
         ensure_dir(os.path.join(folder, "content"))
+
     return id_to_folder, id_to_path_html
 
 def save_all_pages(id_to_folder: Dict[str, str], id_to_path_html: Dict[str, str]):
