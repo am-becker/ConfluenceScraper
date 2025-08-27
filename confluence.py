@@ -36,7 +36,7 @@ BASE_URL = config["base_url"].rstrip("/")
 SPACE_KEY = config["space_key"]
 START_PAGE_URL = f"{BASE_URL}/display/{SPACE_KEY}/{config['start_page']}"
 COOKIES_FILE = config["cookies_file"]
-OFFLINE_AUTHOR = config.get("offline_author", "Aaron Becker")
+OFFLINE_AUTHOR = config.get("offline_author", "Aaron Becker, V0.1α")
 
 # =========================
 # Output Directories
@@ -49,7 +49,7 @@ os.makedirs(ROOT_DIR, exist_ok=True)
 # =========================
 options = Options()
 # options.add_argument("--headless=new")
-options.add_experimental_option("excludeSwitches", ["enable-automation"])
+options.add_experimental_option("excludeSwitches", ["disable-popup-blocking", "enable-automation"])
 options.add_experimental_option("useAutomationExtension", False)
 driver = webdriver.Chrome(service=Service(), options=options)
 session = requests.Session()
@@ -59,7 +59,7 @@ ORIGIN = f"{_u.scheme}://{_u.netloc}"
 CONFLUENCE_NETLOC = _u.netloc
 
 # =========================
-# Cookie helpers (fixed)
+# Cookie helpers (robust)
 # =========================
 def _normalize_cookie(c: dict) -> dict:
     c = c.copy()
@@ -68,7 +68,6 @@ def _normalize_cookie(c: dict) -> dict:
             c["expiry"] = int(c["expiry"])
         except Exception:
             c.pop("expiry", None)
-    # Selenium rejects explicit None for sameSite
     if c.get("sameSite", None) is None:
         c.pop("sameSite", None)
     return c
@@ -81,7 +80,6 @@ def read_cookies_from_pickle() -> List[dict]:
     return cookies
 
 def push_cookies_to_browser(cookies: List[dict]):
-    # Must already be on the correct domain (we'll navigate in build_graph_and_titles)
     added = 0
     for c in cookies:
         try:
@@ -363,13 +361,9 @@ def read_dom_ids_titles_parent() -> Tuple[Optional[str], Optional[str], Optional
         return None, None, None
 
 # =========================
-# PageTree expansion (fixed)
+# PageTree expansion (robust)
 # =========================
 def _visible_collapsed_toggles() -> List[Tuple[str, str, str]]:
-    """
-    Returns list of (toggle_id, page_id, tree_id) for toggles that are *currently collapsed* and visible.
-    Uses aria-expanded != 'true' as the ground truth; tolerates older attributes too.
-    """
     toggles = driver.find_elements(By.CSS_SELECTOR, ".plugin_pagetree a.plugin_pagetree_childtoggle")
     out: List[Tuple[str, str, str]] = []
     for t in toggles:
@@ -390,13 +384,6 @@ def _visible_collapsed_toggles() -> List[Tuple[str, str, str]]:
     return out
 
 def expand_full_pagetree(max_rounds: int = 200, per_click_wait: float = 1.2):
-    """
-    Click *all* visible collapsed toggles. After each click, wait up to ~1.2s for either:
-      - child <ul id="child_ul{pid}-{tid}"> to appear with li's, OR
-      - container #children{pid}-{tid} to show links, OR
-      - aria-expanded flips to true.
-    Repeat until no collapsed toggles remain.
-    """
     print("[PageTree] Expanding tree…")
     time.sleep(5)
     try:
@@ -418,11 +405,9 @@ def expand_full_pagetree(max_rounds: int = 200, per_click_wait: float = 1.2):
         print(f"[PageTree] Round {rounds}: expanding {len(targets)} toggle(s)…")
 
         for toggle_id, pid, tid in targets:
-            # find toggle by id (stable even if the original reference goes stale)
             try:
                 t = driver.find_element(By.ID, toggle_id)
             except Exception:
-                # fallback: query by data-page-id & data-tree-id
                 alt = driver.find_elements(
                     By.CSS_SELECTOR,
                     f"a.plugin_pagetree_childtoggle[data-page-id='{pid}'][data-tree-id='{tid}']"
@@ -431,7 +416,6 @@ def expand_full_pagetree(max_rounds: int = 200, per_click_wait: float = 1.2):
                     continue
                 t = alt[0]
 
-            # Click it
             try:
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", t)
                 try:
@@ -446,17 +430,15 @@ def expand_full_pagetree(max_rounds: int = 200, per_click_wait: float = 1.2):
             container_sel = f"#children{pid}-{tid}"
             child_ul_sel = f"#child_ul{pid}-{tid}"
 
-            # Wait up to per_click_wait seconds for "expanded or loaded"
             end = time.time() + per_click_wait
             while time.time() < end:
                 try:
                     expanded = (t.get_attribute("aria-expanded") or "").strip().lower() == "true"
                 except StaleElementReferenceException:
-                    expanded = True  # assume OK if stale after click
+                    expanded = True
                 except Exception:
                     expanded = False
 
-                # either children <li> exist or links appeared or aria-expanded flipped to true
                 have_children = False
                 try:
                     if driver.find_elements(By.CSS_SELECTOR, f"{child_ul_sel} > li"):
@@ -473,32 +455,20 @@ def expand_full_pagetree(max_rounds: int = 200, per_click_wait: float = 1.2):
                 if expanded or have_children:
                     break
                 time.sleep(0.05)
-
-        # brief pause so DOM settles before next sweep
-        time.sleep(0.5)
+        time.sleep(1)
 
 # =========================
-# PageTree harvest (fixed)
+# PageTree harvest (robust)
 # =========================
 def harvest_pagetree_nodes() -> List[Tuple[str, str, Optional[str], str]]:
-    """
-    Return list of (pageId, title, parentId, href) from the *expanded* Page Tree.
-    pageId detection order:
-      1) toggle[data-page-id]
-      2) span#childrenspan{pageId}-{treeId} id pattern
-      3) parse pageId from link (viewpage.action?pageId=…)
-    """
     results = []
-    # every tree item lives under .plugin_pagetree_children_list li
     items = driver.find_elements(By.CSS_SELECTOR, ".plugin_pagetree_children_list li")
     for li in items:
         try:
-            # anchor & title
             a = li.find_element(By.CSS_SELECTOR, ".plugin_pagetree_children_content a[href]")
             href = a.get_attribute("href")
             title = (a.text or "").strip()
 
-            # pageId via toggle -> childrenspan -> URL param
             page_id = None
             try:
                 tog = li.find_element(By.CSS_SELECTOR, ".plugin_pagetree_childtoggle")
@@ -517,12 +487,9 @@ def harvest_pagetree_nodes() -> List[Tuple[str, str, Optional[str], str]]:
 
             if not page_id:
                 page_id = parse_page_id_from_url(href)
-
             if not page_id:
-                # nothing to do with this row
                 continue
 
-            # parentId from nearest UL id="child_ul{parentId}-{treeId}"
             parent_id = None
             try:
                 parent_ul = li.find_element(By.XPATH, "ancestor::ul[1]")
@@ -536,11 +503,10 @@ def harvest_pagetree_nodes() -> List[Tuple[str, str, Optional[str], str]]:
             results.append((str(page_id), title, parent_id, href))
         except Exception:
             continue
-
     return results
 
 # =========================
-# Content utils, download, offline UI (unchanged from previous good build)
+# Content utils & downloader
 # =========================
 def extract_same_space_links_from_content() -> Set[str]:
     try:
@@ -562,19 +528,44 @@ def extract_same_space_links_from_content() -> Set[str]:
     return found
 
 def download_file(url: str, save_dir: str) -> Optional[str]:
+    """
+    Downloads a non-HTML asset to save_dir, skipping if an existing local file
+    matches the remote Content-Length (checked via HEAD).
+    """
     if not (url.startswith("http://") or url.startswith("https://")):
         url = urljoin(BASE_URL, url)
+
     def _sanitize_filename(fn: str) -> str:
         fn = unquote(fn.split("?")[0].split("/")[-1])
-        fn = re.sub(r"[^A-Za-z0-9._\\-]+", "_", fn)
+        fn = re.sub(r"[^A-Za-z0-9._\-]+", "_", fn)
         return fn or "file"
+
     filename = _sanitize_filename(url)
     ensure_dir(save_dir)
     file_path = os.path.join(save_dir, filename)
-    if os.path.exists(file_path):
-        return filename
+
+    # Try to skip based on HEAD size
+    remote_size = None
     try:
-        resp = session.get(url, stream=True)
+        h = session.head(url, allow_redirects=True, timeout=15)
+        if h.ok:
+            cl = h.headers.get("Content-Length")
+            if cl and cl.isdigit():
+                remote_size = int(cl)
+    except Exception:
+        pass
+
+    if os.path.exists(file_path) and remote_size is not None:
+        try:
+            local_size = os.path.getsize(file_path)
+            if local_size == remote_size:
+                print(f"[Skip] {filename} (already downloaded, {local_size} bytes).")
+                return filename
+        except Exception:
+            pass
+
+    try:
+        resp = session.get(url, stream=True, timeout=60)
         resp.raise_for_status()
         total = int(resp.headers.get("Content-Length", 0) or 0)
         with open(file_path, "wb") as f:
@@ -598,40 +589,46 @@ def download_file(url: str, save_dir: str) -> Optional[str]:
             pass
         return None
 
-# ---------- Offline UI bits (breadcrumbs + collapsible tree, unchanged from previous reply) ----------
+# ---------- Offline UI (larger breadcrumbs, 4-level, visible menu, indent, animations) ----------
 OFFLINE_UI_STYLE = """
 <style>
 *{box-sizing:border-box}
 body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
-:root{--bar-h:48px; --side-w:285px;}
-.ocv-topbar{position:sticky; top:0; z-index:1000; height:var(--bar-h);
-  display:flex; align-items:center; justify-content:space-between;
-  padding:0 8px; border-bottom:1px solid #ddd; background:#fff;}
-.ocv-topbar-btn{border:0;background:transparent;font-size:18px;cursor:pointer;padding:8px}
+:root{--bar-h:96px; --side-w:300px;}
+/* Top bar */
+.ocv-topbar{height:auto; display:flex; align-items:flex-start; justify-content:space-between;
+  padding:8px 10px 10px; border-bottom:1px solid #ddd; background:#fff}
+.ocv-topbar-btn{border:0;background:transparent;font-size:18px;cursor:pointer;padding:8px;align-self:center;display:flex;align-items:center;justify-content:center;}
+/* Branding & breadcrumbs */
 .ocv-brandwrap{display:flex;flex-direction:column;align-items:center;margin:0 auto}
-.ocv-brand{font-weight:700}
-.ocv-author{font-size:12px;color:#888}
-.ocv-breadcrumbs{font-size:12px;color:#555;margin-top:2px}
+.ocv-brand{font-weight:700;font-size:18px;}
+.ocv-author{font-size:12px;color:#888;font-style:italic;}
+.ocv-breadcrumbs{font-size:14px; line-height:1.25; color:#333; margin-top:2px; margin-bottom:2px}
 .ocv-breadcrumbs a{text-decoration:none;color:#1f4aa3}
-.ocv-breadcrumbs .sep{padding:0 4px;color:#aaa}
+.ocv-breadcrumbs .sep{padding:0 6px;color:#aaa}
+/* Layout */
 .ocv-layout{display:grid; grid-template-columns: var(--side-w) 1fr; min-height: calc(100vh - var(--bar-h));}
-.ocv-sidebar{overflow:auto; border-right:1px solid #eee; background:#fafafa; padding:8px 10px}
-.ocv-main{overflow:auto; padding:16px}
-body.sidebar-hidden .ocv-sidebar{display:none}
-body.sidebar-hidden .ocv-layout{grid-template-columns: 1fr}
+.ocv-sidebar{overflow:auto; border-right:1px solid #eee; background:#fafafa; padding:10px 12px;
+  transition: width .22s ease, opacity .22s ease, padding .22s ease, border-width .22s ease}
+.ocv-main{overflow:auto; padding:20px 16px 16px}
+/* Collapsing (animated) */
+body.nav-collapsed .ocv-layout{grid-template-columns: 0 1fr}
+body.nav-collapsed .ocv-sidebar{width:0; min-width:0; padding:0; border-width:0; opacity:0; pointer-events:none}
+/* Info panel */
 .ocv-info{position:fixed; right:8px; top:calc(var(--bar-h) + 8px); width:320px; max-height:60vh; overflow:auto;
   border:1px solid #ddd; background:#fff; box-shadow:0 6px 24px rgba(0,0,0,.12); padding:12px; display:none; z-index:1200;}
 .ocv-info.open{display:block}
 .meta-kv{font-size:14px;line-height:1.5}
 .meta-kv dt{font-weight:600}
 .meta-kv dd{margin:0 0 8px 0; word-break:break-all}
-/* Collapsible tree */
+/* Collapsible tree with clearer indentation */
 .ocv-tree{font-size:14px}
 .ocv-tree a{color:#1f4aa3;text-decoration:none}
-.ocv-tree details{margin:2px 0}
+.ocv-tree details{margin:3px 0}
+.ocv-tree details details{margin-left:14px}
 .ocv-tree summary{cursor:pointer; list-style:none; display:flex; align-items:center; gap:4px}
 .ocv-tree summary::-webkit-details-marker{display:none}
-.ocv-tree summary .tw{display:inline-block; width:1em; text-align:center}
+.ocv-tree summary .tw{display:inline-block; width:1em; text-align:center; transition: transform .15s ease}
 .ocv-tree details[open] > summary .tw{transform:rotate(90deg)}
 .ocv-tree .leaf{padding-left:1.4em; display:block; margin:2px 0}
 .ocv-tree .active > a, .ocv-tree a.active{font-weight:700; text-decoration:underline}
@@ -644,7 +641,7 @@ OFFLINE_UI_SCRIPT = """
   const navBtn = document.getElementById('navToggle');
   const infoBtn = document.getElementById('infoToggle');
   const info = document.querySelector('.ocv-info');
-  navBtn.addEventListener('click', ()=>{ document.body.classList.toggle('sidebar-hidden'); });
+  navBtn.addEventListener('click', ()=>{ document.body.classList.toggle('nav-collapsed'); });
   infoBtn.addEventListener('click', ()=>{ info.classList.toggle('open'); });
 })();
 </script>
@@ -657,11 +654,13 @@ def render_breadcrumbs(current_id: str, id_to_path_html: Dict[str, str]) -> str:
         chain_ids.append(cur)
         cur = GRAPH.nodes[cur].parent_id
     chain_ids.reverse()
-    kept = chain_ids[-3:] if len(chain_ids) > 3 else chain_ids
+
+    # keep last 4; if more, show "…" to the 5th-from-last ancestor
+    kept = chain_ids[-4:] if len(chain_ids) > 4 else chain_ids
     out = []
     my_dir = os.path.dirname(id_to_path_html[current_id])
-    if len(chain_ids) > 3:
-        anc = chain_ids[-4]
+    if len(chain_ids) > 4:
+        anc = chain_ids[-5]
         anc_href = rel_href(my_dir, id_to_path_html[anc])
         out.append(f'<a href="{anc_href}">…</a><span class="sep">→</span>')
     for i, nid in enumerate(kept):
@@ -679,11 +678,11 @@ def build_tree_details_html(current_id: str, id_to_path_html: Dict[str, str]) ->
     def is_ancestor(anc: str, desc: str) -> bool:
         c = desc
         while c is not None:
-            if c == anc:
-                return True
+            if c == anc: return True
             c = GRAPH.nodes[c].parent_id
         return False
     def children_sorted(pid: str) -> List[str]:
+        kids = list(GRAPH.nodes[p].children) if (p:=pid) else []
         kids = list(GRAPH.nodes[pid].children)
         kids.sort(key=lambda k: (GRAPH.nodes[k].title or "", k))
         return kids
@@ -724,7 +723,7 @@ def wrap_offline_shell(page_title: str,
 <title>{html.escape(page_title)}</title>
 {OFFLINE_UI_STYLE}
 </head>
-<body class="sidebar-hidden">
+<body>
   <header class="ocv-topbar">
     <button id="navToggle" class="ocv-topbar-btn" aria-label="Toggle navigation">☰</button>
     <div class="ocv-brandwrap">
@@ -751,7 +750,7 @@ def wrap_offline_shell(page_title: str,
 </html>"""
 
 # =========================
-# Saving with offline UI + link rewriting (unchanged core)
+# Saving with offline UI + link rewriting
 # =========================
 def save_page_html(node: PageNode,
                    id_to_folder: Dict[str, str],
@@ -776,6 +775,12 @@ def save_page_html(node: PageNode,
                     soup.find("main") or soup.find("article"))
     if not main_content:
         main_content = soup.new_tag("div")
+
+    # empty: just fill w/placeholder
+    if not main_content.get_text(strip=True):
+        placeholder = soup.new_tag("p")
+        placeholder.string = "(Page Content Empty)"
+        main_content.append(placeholder)
 
     page_folder = id_to_folder[node.id]
     content_dir = os.path.join(page_folder, "content")
@@ -815,14 +820,41 @@ def save_page_html(node: PageNode,
                     return nid
         return None
 
+    # Link rewriting (with email-profile → mailto and cross-space pageId support)
     for a in main_content.find_all("a", href=True):
-        href0, frag = urldefrag(a["href"])
+        raw_href = a["href"]
+        href0, frag = urldefrag(raw_href)
+
+        # 1) /display/~email or data-username -> mailto:
+        try:
+            absu = urljoin(BASE_URL + "/", href0)
+            pu = urlparse(absu)
+            data_user = (a.get("data-username") or "").strip()
+            candidate = data_user if ("@" in data_user) else None
+            if not candidate:
+                m = re.search(r"/display/~([^/?#]+)", pu.path or "", flags=re.IGNORECASE)
+                if m:
+                    candidate = unquote(m.group(1))
+            if candidate and "@" in candidate:
+                a["href"] = f"mailto:{candidate}"
+                continue
+        except Exception:
+            pass
+
         cl = clean_url(href0)
-        if not cl or not same_space(cl):
+        if not cl:
             continue
+
+        # 2) Try pageId resolution first (even if not same-space)
         tid = resolve_target_id(cl)
         if not tid:
-            continue
+            # If still not resolved, only proceed if it's clearly the same space
+            if not same_space(cl):
+                continue
+            tid = resolve_target_id(cl)
+            if not tid:
+                continue
+
         target_html = id_to_path_html.get(tid)
         if not target_html:
             continue
@@ -830,6 +862,7 @@ def save_page_html(node: PageNode,
         rel = rel_href(cur_dir, target_html)
         a["href"] = rel + (("#" + frag) if frag else "")
 
+    # Images
     for img in main_content.find_all("img", src=True):
         src = img["src"]
         if not (src.startswith("http://") or src.startswith("https://")):
@@ -838,6 +871,7 @@ def save_page_html(node: PageNode,
         if local:
             img["src"] = f"./content/{local}"
 
+    # Attachments
     for a in main_content.find_all("a", href=True):
         h = a["href"]
         if "/download/attachments/" in h:
@@ -866,26 +900,25 @@ def save_page_html(node: PageNode,
     return True
 
 # =========================
-# Crawl orchestration (cookie preload fixed)
+# Crawl orchestration
 # =========================
 def build_graph_and_titles():
-    # 1) Navigate to site root and restore cookies BEFORE going to the start page
-    driver.get(ORIGIN)  # must be on correct domain to set cookies
+    # 1) Preload cookies on origin BEFORE navigating to the start page
+    driver.get(ORIGIN)
     cookies = read_cookies_from_pickle()
     if cookies:
         push_cookies_to_browser(cookies)
         push_cookies_to_requests(cookies)
-        # Reload origin so cookies take effect server-side
-        driver.get(ORIGIN)
+        driver.get(ORIGIN)  # ensure cookies are applied
 
-    # 2) Now go straight to the intended start page
+    # 2) Navigate to the start page
     driver.get(START_PAGE_URL)
 
     print("[Login] Waiting for successful login or cookie auth…")
     while True:
         time.sleep(1)
         if page_matches_start(driver.current_url):
-            save_cookies()  # persist any refreshed or new tokens immediately
+            save_cookies()  # persist any refreshed or new tokens
             break
     print(f"[Login] Success. URL={driver.current_url}")
 
