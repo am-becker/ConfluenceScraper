@@ -1,7 +1,6 @@
 {
     "base_url": "https://wikis.mit.edu/confluence",
-    //"space_key": "2DOT671",
-    //"start_page": "2.671+Home",
-    "space_key": "ILAB2",
+    "space_key": "MITSET",
+    "start_page": "Home",
     "cookies_file": "cookies.pkl"
 }
