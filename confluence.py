@@ -23,6 +23,8 @@ from selenium.common.exceptions import StaleElementReferenceException
 
 """
 Confluence Space Downloader — ID-first, hierarchical, offline viewer
+Now supports iterating over multiple Confluence start links via config["links"].
+Each link should be "SPACE_KEY/START_PAGE" (e.g., "RocketTeam/MIT+Rocket+Team+Home").
 """
 
 # =========================
@@ -33,16 +35,38 @@ with open(CONFIG_FILE, "r", encoding="utf-8") as f:
     config = json.load(f)
 
 BASE_URL = config["base_url"].rstrip("/")
-SPACE_KEY = config["space_key"]
-START_PAGE_URL = f"{BASE_URL}/display/{SPACE_KEY}/{config['start_page']}"
 COOKIES_FILE = config["cookies_file"]
 OFFLINE_AUTHOR = config.get("offline_author", "Aaron Becker, V0.1α")
 
+# Backward compatibility: allow legacy keys if "links" not provided
+_links_from_config = config.get("links")
+if not _links_from_config:
+    # expect legacy: space_key + start_page
+    legacy_space = config.get("space_key")
+    legacy_start = config.get("start_page")
+    if not (legacy_space and legacy_start):
+        raise RuntimeError('Provide either {"links": [...]} OR legacy {"space_key","start_page"} in config.json')
+    _links_from_config = [f"{legacy_space}/{legacy_start}"]
+
+# Parse links into (SPACE_KEY, START_PAGE) tuples
+def parse_link(link: str) -> Tuple[str, str]:
+    parts = [p for p in (link or "").split("/") if p]
+    if len(parts) < 2:
+        raise ValueError(f'Invalid link "{link}". Expected "SPACE_KEY/START_PAGE"')
+    space_key = parts[0]
+    start_page = "/".join(parts[1:])  # in case someone includes extra segments
+    return space_key, start_page
+
+LINKS: List[Tuple[str, str]] = [parse_link(l) for l in _links_from_config]
+
 # =========================
-# Output Directories
+# Globals that change per link (set inside the loop)
 # =========================
-ROOT_DIR = f"{SPACE_KEY}_offline"
-os.makedirs(ROOT_DIR, exist_ok=True)
+SPACE_KEY: str = ""
+CURRENT_START_PAGE: str = ""
+START_PAGE_URL: str = ""
+ROOT_DIR: str = ""
+GRAPH = None  # set to SpaceGraph per link
 
 # =========================
 # WebDriver + requests.Session
@@ -80,6 +104,7 @@ def read_cookies_from_pickle() -> List[dict]:
     return cookies
 
 def push_cookies_to_browser(cookies: List[dict]):
+    # NOTE: you must be on ORIGIN before calling this (driver.get(ORIGIN))
     added = 0
     for c in cookies:
         try:
@@ -90,20 +115,43 @@ def push_cookies_to_browser(cookies: List[dict]):
     print(f"[Cookie] Restored {added} cookies to Selenium for {CONFLUENCE_NETLOC}")
 
 def push_cookies_to_requests(cookies: List[dict]):
+    """Mirror Selenium cookies into requests with proper keys to avoid de-duping."""
+    import time as _time
     session.cookies.clear()
+    mirrored = 0
     for c in cookies:
         try:
+            # skip expired cookies
+            if c.get("expiry") is not None:
+                try:
+                    if int(c["expiry"]) <= int(_time.time()):
+                        continue
+                except Exception:
+                    pass
+
+            domain = c.get("domain") or CONFLUENCE_NETLOC
+            path = c.get("path") or "/"
+            secure = bool(c.get("secure", False))
+            rest = {}
+            # Preserve HttpOnly & SameSite if present
+            if c.get("httpOnly") is True:
+                rest["HttpOnly"] = True
+            if c.get("sameSite"):
+                rest["SameSite"] = c["sameSite"]
+
             rc = requests.cookies.create_cookie(
                 name=c["name"],
                 value=c["value"],
-                domain=c.get("domain") or CONFLUENCE_NETLOC,
-                path=c.get("path", "/"),
-                secure=c.get("secure", True),
+                domain=domain,
+                path=path,
+                secure=secure,
+                rest=rest
             )
             session.cookies.set_cookie(rc)
+            mirrored += 1
         except Exception as e:
             print(f"[Cookie] Requests skip {c.get('name')}: {e}")
-    print(f"[Cookie] Mirrored {len(session.cookies)} cookies into requests.Session")
+    print(f"[Cookie] Mirrored {mirrored}/{len(cookies)} cookies into requests.Session")
 
 def save_cookies():
     cookies = driver.get_cookies()
@@ -243,12 +291,11 @@ class SpaceGraph:
     def all_ids(self) -> List[str]:
         return list(self.nodes.keys())
 
-GRAPH = SpaceGraph(SPACE_KEY)
-
 # =========================
 # Login gate helpers
 # =========================
 def page_matches_start(url: str) -> bool:
+    # Uses globals: SPACE_KEY, CURRENT_START_PAGE
     u = urlparse(url)
     if "/display/" in (u.path or ""):
         parts = [p for p in u.path.split("/") if p]
@@ -256,19 +303,19 @@ def page_matches_start(url: str) -> bool:
             i = parts.index("display")
             space = parts[i + 1]
             title = unquote(parts[i + 2]).replace("+", " ") if len(parts) > i + 2 else ""
-            return normalize_text(space) == normalize_text(SPACE_KEY) and normalize_text(title) == normalize_text(config["start_page"])
+            return normalize_text(space) == normalize_text(SPACE_KEY) and normalize_text(title) == normalize_text(CURRENT_START_PAGE)
         except Exception:
             pass
     if (u.path or "").endswith("/pages/viewpage.action"):
         q = parse_qs(u.query)
-        if normalize_text(q.get("spaceKey", [""])[0]) == normalize_text(SPACE_KEY) and normalize_text(q.get("title", [""])[0]) == normalize_text(config["start_page"]):
+        if normalize_text(q.get("spaceKey", [""])[0]) == normalize_text(SPACE_KEY) and normalize_text(q.get("title", [""])[0]) == normalize_text(CURRENT_START_PAGE):
             return True
     try:
         h1 = WebDriverWait(driver, 2).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "#title-text a"))
         )
         title = (h1.text or "").strip()
-        return normalize_text(title) == normalize_text(config["start_page"])
+        return normalize_text(title) == normalize_text(CURRENT_START_PAGE)
     except Exception:
         return False
 
@@ -384,7 +431,7 @@ def _visible_collapsed_toggles() -> List[Tuple[str, str, str]]:
     return out
 
 def expand_full_pagetree(max_rounds: int = 200, per_click_wait: float = 1.2):
-    print("[PageTree] Expanding tree…")
+    print("[PageTree] Expanding tree...")
     time.sleep(5)
     try:
         WebDriverWait(driver, 15).until(
@@ -402,7 +449,7 @@ def expand_full_pagetree(max_rounds: int = 200, per_click_wait: float = 1.2):
             print(f"[PageTree] Done (no more collapsed toggles after {rounds-1} rounds).")
             break
 
-        print(f"[PageTree] Round {rounds}: expanding {len(targets)} toggle(s)…")
+        print(f"[PageTree] Round {rounds}: expanding {len(targets)} toggle(s)...")
 
         for toggle_id, pid, tid in targets:
             try:
@@ -544,23 +591,11 @@ def download_file(url: str, save_dir: str) -> Optional[str]:
     ensure_dir(save_dir)
     file_path = os.path.join(save_dir, filename)
 
-    # Try to skip based on HEAD size
-    remote_size = None
-    try:
-        h = session.head(url, allow_redirects=True, timeout=15)
-        if h.ok:
-            cl = h.headers.get("Content-Length")
-            if cl and cl.isdigit():
-                remote_size = int(cl)
-    except Exception:
-        pass
-
-    if os.path.exists(file_path) and remote_size is not None:
+    if os.path.exists(file_path):
         try:
             local_size = os.path.getsize(file_path)
-            if local_size == remote_size:
-                print(f"[Skip] {filename} (already downloaded, {local_size} bytes).")
-                return filename
+            print(f"[Skip] {filename} (already downloaded, {local_size} bytes).")
+            return filename
         except Exception:
             pass
 
@@ -589,7 +624,7 @@ def download_file(url: str, save_dir: str) -> Optional[str]:
             pass
         return None
 
-# ---------- Offline UI (larger breadcrumbs, 4-level, visible menu, indent, animations) ----------
+# ---------- Offline UI (unchanged) ----------
 OFFLINE_UI_STYLE = """
 <style>
 *{box-sizing:border-box}
@@ -611,17 +646,14 @@ body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Aria
 .ocv-sidebar{overflow:auto; border-right:1px solid #eee; background:#fafafa; padding:10px 12px;
   transition: width .22s ease, opacity .22s ease, padding .22s ease, border-width .22s ease}
 .ocv-main{overflow:auto; padding:20px 16px 16px}
-/* Collapsing (animated) */
 body.nav-collapsed .ocv-layout{grid-template-columns: 0 1fr}
 body.nav-collapsed .ocv-sidebar{width:0; min-width:0; padding:0; border-width:0; opacity:0; pointer-events:none}
-/* Info panel */
 .ocv-info{position:fixed; right:8px; top:calc(var(--bar-h) + 8px); width:320px; max-height:60vh; overflow:auto;
   border:1px solid #ddd; background:#fff; box-shadow:0 6px 24px rgba(0,0,0,.12); padding:12px; display:none; z-index:1200;}
 .ocv-info.open{display:block}
 .meta-kv{font-size:14px;line-height:1.5}
 .meta-kv dt{font-weight:600}
 .meta-kv dd{margin:0 0 8px 0; word-break:break-all}
-/* Collapsible tree with clearer indentation */
 .ocv-tree{font-size:14px}
 .ocv-tree a{color:#1f4aa3;text-decoration:none}
 .ocv-tree details{margin:3px 0}
@@ -655,14 +687,13 @@ def render_breadcrumbs(current_id: str, id_to_path_html: Dict[str, str]) -> str:
         cur = GRAPH.nodes[cur].parent_id
     chain_ids.reverse()
 
-    # keep last 4; if more, show "…" to the 5th-from-last ancestor
     kept = chain_ids[-4:] if len(chain_ids) > 4 else chain_ids
     out = []
     my_dir = os.path.dirname(id_to_path_html[current_id])
     if len(chain_ids) > 4:
         anc = chain_ids[-5]
         anc_href = rel_href(my_dir, id_to_path_html[anc])
-        out.append(f'<a href="{anc_href}">…</a><span class="sep">→</span>')
+        out.append(f'<a href="{anc_href}">...</a><span class="sep">→</span>')
     for i, nid in enumerate(kept):
         title = html.escape(GRAPH.nodes[nid].title or f"page-{nid}")
         href = rel_href(my_dir, id_to_path_html[nid])
@@ -682,7 +713,6 @@ def build_tree_details_html(current_id: str, id_to_path_html: Dict[str, str]) ->
             c = GRAPH.nodes[c].parent_id
         return False
     def children_sorted(pid: str) -> List[str]:
-        kids = list(GRAPH.nodes[p].children) if (p:=pid) else []
         kids = list(GRAPH.nodes[pid].children)
         kids.sort(key=lambda k: (GRAPH.nodes[k].title or "", k))
         return kids
@@ -776,7 +806,6 @@ def save_page_html(node: PageNode,
     if not main_content:
         main_content = soup.new_tag("div")
 
-    # empty: just fill w/placeholder
     if not main_content.get_text(strip=True):
         placeholder = soup.new_tag("p")
         placeholder.string = "(Page Content Empty)"
@@ -820,12 +849,10 @@ def save_page_html(node: PageNode,
                     return nid
         return None
 
-    # Link rewriting (with email-profile → mailto and cross-space pageId support)
     for a in main_content.find_all("a", href=True):
         raw_href = a["href"]
         href0, frag = urldefrag(raw_href)
 
-        # 1) /display/~email or data-username -> mailto:
         try:
             absu = urljoin(BASE_URL + "/", href0)
             pu = urlparse(absu)
@@ -845,10 +872,8 @@ def save_page_html(node: PageNode,
         if not cl:
             continue
 
-        # 2) Try pageId resolution first (even if not same-space)
         tid = resolve_target_id(cl)
         if not tid:
-            # If still not resolved, only proceed if it's clearly the same space
             if not same_space(cl):
                 continue
             tid = resolve_target_id(cl)
@@ -862,7 +887,6 @@ def save_page_html(node: PageNode,
         rel = rel_href(cur_dir, target_html)
         a["href"] = rel + (("#" + frag) if frag else "")
 
-    # Images
     for img in main_content.find_all("img", src=True):
         src = img["src"]
         if not (src.startswith("http://") or src.startswith("https://")):
@@ -871,7 +895,6 @@ def save_page_html(node: PageNode,
         if local:
             img["src"] = f"./content/{local}"
 
-    # Attachments
     for a in main_content.find_all("a", href=True):
         h = a["href"]
         if "/download/attachments/" in h:
@@ -914,7 +937,7 @@ def build_graph_and_titles():
     # 2) Navigate to the start page
     driver.get(START_PAGE_URL)
 
-    print("[Login] Waiting for successful login or cookie auth…")
+    print("[Login] Waiting for successful login or cookie auth...")
     while True:
         time.sleep(1)
         if page_matches_start(driver.current_url):
@@ -942,7 +965,7 @@ def build_graph_and_titles():
 
     # Expand + Harvest
     expand_full_pagetree()
-    print("[PageTree] Harvesting…")
+    print("[PageTree] Harvesting...")
     entries = harvest_pagetree_nodes()
     print(f"[PageTree] Found {len(entries)} entries.")
     for pid, t, parent_id, href in entries:
@@ -961,7 +984,6 @@ def build_graph_and_titles():
     while queue:
         cur = queue.pop(0)
         if cur in visited_ids:
-            # show progress even if already visited (rare)
             total_now = len(visited_ids) + len(queue)
             pct = (len(visited_ids) / total_now * 100) if total_now else 100.0
             print(f"[Crawl] Progress: {pct:.1f}% ({len(visited_ids)}/{total_now} discovered)")
@@ -994,7 +1016,7 @@ def build_graph_and_titles():
                     queue.append(pid)
             else:
                 try:
-                    ecid, etitle, eparent = navigate_and_wait(link, 35)
+                    ecid, etitle, eparent = navigate_and_wait(link, 10)
                     if ecid:
                         ecid = str(ecid)
                         nn = GRAPH.get_or_create(ecid)
@@ -1008,8 +1030,6 @@ def build_graph_and_titles():
                 except Exception:
                     pass
 
-
-        # ---- progress after every page visit ----
         total_now = len(visited_ids) + len(queue)
         pct = (len(visited_ids) / total_now * 100) if total_now else 100.0
         print(f"[Crawl] Progress: {pct:.1f}% ({len(visited_ids)}/{total_now} discovered)")
@@ -1084,11 +1104,18 @@ def save_all_pages(id_to_folder: Dict[str, str], id_to_path_html: Dict[str, str]
         dfs(GRAPH.root_id, order)
     else:
         order = GRAPH.all_ids()
-    for nid in order:
+    
+    total = len(order)
+    for idx, nid in enumerate(order, start=1):
+        title = GRAPH.nodes[nid].title or f"page-{nid}"
         try:
-            save_page_html(GRAPH.nodes[nid], id_to_folder, id_to_path_html)
+            ok = save_page_html(GRAPH.nodes[nid], id_to_folder, id_to_path_html)
+            status = "ok" if ok else "skip"
         except Exception as e:
             print(f"[Error] Saving {nid}: {e}")
+            status = "error"
+        percent = int((idx / total) * 100) if total else 100
+        print(f"{idx}/{total} ({percent}%) {status}: {title[:40]}")
     with open(os.path.join(ROOT_DIR, "offline_graph.json"), "w", encoding="utf-8") as f:
         json.dump({
             "space": SPACE_KEY,
@@ -1106,15 +1133,37 @@ def save_all_pages(id_to_folder: Dict[str, str], id_to_path_html: Dict[str, str]
         }, f, indent=2)
 
 # =========================
+# Per-link runner
+# =========================
+def run_one_space(space_key: str, start_page: str):
+    global SPACE_KEY, CURRENT_START_PAGE, START_PAGE_URL, ROOT_DIR, GRAPH
+    SPACE_KEY = space_key
+    CURRENT_START_PAGE = start_page
+    START_PAGE_URL = f"{BASE_URL}/display/{SPACE_KEY}/{CURRENT_START_PAGE}"
+    ROOT_DIR = f"{SPACE_KEY}_offline"
+    ensure_dir(ROOT_DIR)
+    GRAPH = SpaceGraph(SPACE_KEY)
+
+    print("\n" + "="*80)
+    print(f"[Run] Space={SPACE_KEY}  StartPage={CURRENT_START_PAGE}")
+    print(f"[Run] Start URL: {START_PAGE_URL}")
+    print(f"[Run] Output dir: {ROOT_DIR}")
+    print("="*80)
+
+    build_graph_and_titles()
+    id_to_folder, id_to_path_html = materialize_folders()
+    save_all_pages(id_to_folder, id_to_path_html)
+    print(f"[Run] Finished dumping all files for {SPACE_KEY}.")
+    #save_cookies()  # persist any refreshed tokens
+
+# =========================
 # Main
 # =========================
 if __name__ == "__main__":
     try:
-        build_graph_and_titles()
-        id_to_folder, id_to_path_html = materialize_folders()
-        save_all_pages(id_to_folder, id_to_path_html)
-        print("Finished dumping all files.")
-        save_cookies()  # persist any refreshed tokens
+        for sp_key, sp_start in LINKS:
+            run_one_space(sp_key, sp_start)
+        print("All runs complete.")
     finally:
         try:
             driver.quit()
