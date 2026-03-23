@@ -19,7 +19,11 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import (
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 
 """
 Confluence Space Downloader — ID-first, hierarchical, offline viewer
@@ -36,7 +40,8 @@ with open(CONFIG_FILE, "r", encoding="utf-8") as f:
 
 BASE_URL = config["base_url"].rstrip("/")
 COOKIES_FILE = config["cookies_file"]
-OFFLINE_AUTHOR = config.get("offline_author", "Aaron Becker, V0.1α")
+OFFLINE_AUTHOR = config.get("offline_author", "Aaron Becker, V0.2α")
+CHROME_PROFILE_DIR = config.get("chrome_profile_dir", ".chrome-profile")
 
 # Backward compatibility: allow legacy keys if "links" not provided
 _links_from_config = config.get("links")
@@ -75,8 +80,52 @@ options = Options()
 # options.add_argument("--headless=new")
 options.add_experimental_option("excludeSwitches", ["disable-popup-blocking", "enable-automation"])
 options.add_experimental_option("useAutomationExtension", False)
-driver = webdriver.Chrome(service=Service(), options=options)
+options.page_load_strategy = "eager"
+options.add_argument("--disable-extensions")
+options.add_argument("--no-first-run")
+options.add_argument("--no-default-browser-check")
+options.add_argument("--js-flags=--max-old-space-size=4096")  # MB, adjust 2048/4096/8192
+
+# critical: persist the full browser session
+options.add_argument(f"--user-data-dir={os.path.abspath(CHROME_PROFILE_DIR)}")
+options.add_argument("--profile-directory=Default")
+
+def make_driver() -> webdriver.Chrome:
+    d = webdriver.Chrome(service=Service(), options=options)
+    d.set_page_load_timeout(25)
+    return d
+
+driver = make_driver()
 session = requests.Session()
+
+VISITS_BEFORE_RESTART = 10
+visits = 0
+restarts = 0
+
+def maybe_restart_driver(force=False):
+    global driver, visits, restarts
+    if visits >= VISITS_BEFORE_RESTART or force:
+        print("Restarting driver...")
+        restarts += 1
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+        driver = make_driver()
+
+        # Give it a little time
+        time.sleep(1)
+
+        # restore login session
+        driver.get(ORIGIN)
+        time.sleep(2)
+        cookies = read_cookies_from_pickle()
+        if cookies:
+            push_cookies_to_browser(cookies) # ensure cookies are applied
+        driver.get(ORIGIN)
+
+        visits = 0
 
 _u = urlparse(BASE_URL)
 ORIGIN = f"{_u.scheme}://{_u.netloc}"
@@ -375,12 +424,73 @@ def wait_for_main_content(timeout_sec: int = 20) -> bool:
         time.sleep(0.2)
     return False
 
-def navigate_and_wait(url: str, timeout_sec: int = 45) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    driver.get(url)
-    wait_for_dom_ready(min(10, timeout_sec))
-    cid, title, parent = wait_for_page_identity(max(0, timeout_sec - 10))
-    wait_for_main_content(15)
-    return cid, title, parent
+def _best_effort_stop_page_load():
+    try:
+        driver.execute_script("window.stop();")
+    except Exception:
+        pass
+    try:
+        driver.execute_cdp_cmd("Page.stopLoading", {})
+    except Exception:
+        pass
+
+# def navigate_and_wait(url: str, timeout_sec: int = 45) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+#     driver.get(url)
+#     wait_for_dom_ready(min(10, timeout_sec))
+#     cid, title, parent = wait_for_page_identity(max(0, timeout_sec - 10))
+#     wait_for_main_content(15)
+#     return cid, title, parent
+
+def navigate_and_wait(url: str, timeout_sec: int = 45, allow_restart: bool = True) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    global visits, restarts
+
+    # Allow restart of browser client if beyond limit
+    if allow_restart:
+        #print("ALLOWED TO RESTART")
+        maybe_restart_driver()
+    #else:
+        #print("NOT ALLOWED TO RESTART")
+
+    attempts = 2
+    last_err = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            visits += 1
+            print(f"[Nav] GET {url} (attempt {attempt}/{attempts}, visit {visits}), restarts {restarts}")
+            driver.get(url)
+
+        except TimeoutException as e:
+            print(f"[Nav] Page load timeout for {url}; forcing driver restart.")
+            last_err = e
+            #_best_effort_stop_page_load()
+            # Force driver restart on timeout
+            maybe_restart_driver(force=True)
+
+        except WebDriverException as e:
+            print(f"[Nav] WebDriver error on {url}: {e}")
+            last_err = e
+            continue
+
+        # Wait for DOM ready, then get page info (title and parent)
+        wait_for_dom_ready(min(10, timeout_sec))
+        cid, title, parent = wait_for_page_identity(max(5, timeout_sec - 8))
+
+        # Wait for page content
+        try:
+            wait_for_main_content(10)
+        except Exception:
+            pass
+
+        if cid or title:
+            return cid, title, parent
+
+        cid, title, parent = read_dom_ids_titles_parent()
+        if cid or title:
+            return cid, title, parent
+
+    print(f"[Nav] Failed to identify page: {url} ({last_err})")
+    return None, None, None
 
 # =========================
 # DOM extraction helpers
@@ -432,7 +542,13 @@ def _visible_collapsed_toggles() -> List[Tuple[str, str, str]]:
 
 def expand_full_pagetree(max_rounds: int = 200, per_click_wait: float = 1.2):
     print("[PageTree] Expanding tree...")
-    time.sleep(5)
+    
+    if not ensure_sidebar_expanded():
+        print("[PageTree] Sidebar appears collapsed and could not be expanded.")
+        return
+    
+    # Lil extra time to process
+    time.sleep(1.0)
     try:
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, ".plugin_pagetree"))
@@ -504,53 +620,173 @@ def expand_full_pagetree(max_rounds: int = 200, per_click_wait: float = 1.2):
                 time.sleep(0.05)
         time.sleep(1)
 
-# =========================
-# PageTree harvest (robust)
-# =========================
+# # =========================
+# # PageTree harvest (robust)
+# # =========================
+# def harvest_pagetree_nodes() -> List[Tuple[str, str, Optional[str], str]]:
+#     results = []
+#     items = driver.find_elements(By.CSS_SELECTOR, ".plugin_pagetree_children_list li")
+#     for li in items:
+#         try:
+#             a = li.find_element(By.CSS_SELECTOR, ".plugin_pagetree_children_content a[href]")
+#             href = a.get_attribute("href")
+#             title = (a.text or "").strip()
+
+#             page_id = None
+#             try:
+#                 tog = li.find_element(By.CSS_SELECTOR, ".plugin_pagetree_childtoggle")
+#                 page_id = tog.get_attribute("data-page-id")
+#             except Exception:
+#                 page_id = None
+
+#             if not page_id:
+#                 try:
+#                     span = li.find_element(By.CSS_SELECTOR, ".plugin_pagetree_children_span[id]")
+#                     m = re.search(r"childrenspan(\d+)-", span.get_attribute("id") or "")
+#                     if m:
+#                         page_id = m.group(1)
+#                 except Exception:
+#                     page_id = None
+
+#             if not page_id:
+#                 page_id = parse_page_id_from_url(href)
+#             if not page_id:
+#                 continue
+
+#             parent_id = None
+#             try:
+#                 parent_ul = li.find_element(By.XPATH, "ancestor::ul[1]")
+#                 ul_id = parent_ul.get_attribute("id") or ""
+#                 m = re.search(r"child_ul(\d+)-", ul_id)
+#                 if m:
+#                     parent_id = m.group(1)
+#             except Exception:
+#                 pass
+
+#             results.append((str(page_id), title, parent_id, href))
+#         except Exception:
+#             continue
+#     return results
+
 def harvest_pagetree_nodes() -> List[Tuple[str, str, Optional[str], str]]:
-    results = []
-    items = driver.find_elements(By.CSS_SELECTOR, ".plugin_pagetree_children_list li")
-    for li in items:
+    js = r"""
+    function parsePageIdFromHref(href) {
+        try {
+            const u = new URL(href, document.baseURI);
+            if (u.pathname.endsWith('/pages/viewpage.action')) {
+                return u.searchParams.get('pageId');
+            }
+        } catch(e){}
+        return null;
+    }
+
+    const results = [];
+    const items = document.querySelectorAll(".plugin_pagetree_children_list li");
+
+    for (const li of items) {
+        try {
+            const a = li.querySelector(".plugin_pagetree_children_content a[href]");
+            if (!a) continue;
+
+            const href = a.href;
+            const title = (a.textContent || "").trim();
+
+            let pageId = null;
+
+            const tog = li.querySelector(".plugin_pagetree_childtoggle");
+            if (tog) {
+                pageId = tog.getAttribute("data-page-id");
+            }
+
+            if (!pageId) {
+                const span = li.querySelector(".plugin_pagetree_children_span[id]");
+                if (span) {
+                    const m = span.id.match(/childrenspan(\d+)-/);
+                    if (m) pageId = m[1];
+                }
+            }
+
+            if (!pageId) {
+                pageId = parsePageIdFromHref(href);
+            }
+
+            if (!pageId) continue;
+
+            let parentId = null;
+            const parentUl = li.closest("ul");
+            if (parentUl) {
+                const m = (parentUl.id || "").match(/child_ul(\d+)-/);
+                if (m) parentId = m[1];
+            }
+
+            results.push([String(pageId), title, parentId ? String(parentId) : null, href]);
+        } catch(e) {}
+    }
+
+    return results;
+    """
+    
+    try:
+        raw = driver.execute_script(js) or []
+        return [(pid, title, parent_id, href) for pid, title, parent_id, href in raw]
+    except Exception as e:
+        print(f"[PageTree] harvest failed: {e}")
+        return []
+
+def ensure_sidebar_expanded(timeout_sec: int = 10) -> bool:
+    js_is_collapsed = """
+    const sb = document.querySelector('.ia-fixed-sidebar');
+    if (!sb) return false;
+    return sb.classList.contains('collapsed');
+    """
+
+    js_expand = """
+    const sb = document.querySelector('.ia-fixed-sidebar');
+    if (!sb) return false;
+    if (!sb.classList.contains('collapsed')) return true;
+
+    const btn =
+        document.querySelector('.expand-collapse-trigger') ||
+        document.querySelector('.ia-splitter-handle') ||
+        document.querySelector('[aria-label*="Expand sidebar"]') ||
+        document.querySelector('[data-tooltip*="Expand sidebar"]');
+
+    if (!btn) return false;
+
+    btn.click();
+    return true;
+    """
+
+    js_tree_visible = """
+    const sb = document.querySelector('.ia-fixed-sidebar');
+    const tree = document.querySelector('.plugin_pagetree');
+    if (!sb || !tree) return false;
+
+    const collapsed = sb.classList.contains('collapsed');
+    const style = window.getComputedStyle(tree);
+    const visible = style && style.display !== 'none' && style.visibility !== 'hidden';
+    const rect = tree.getBoundingClientRect();
+
+    return !collapsed && visible && rect.width > 0 && rect.height > 0;
+    """
+
+    deadline = time.time() + timeout_sec
+
+    while time.time() < deadline:
         try:
-            a = li.find_element(By.CSS_SELECTOR, ".plugin_pagetree_children_content a[href]")
-            href = a.get_attribute("href")
-            title = (a.text or "").strip()
-
-            page_id = None
-            try:
-                tog = li.find_element(By.CSS_SELECTOR, ".plugin_pagetree_childtoggle")
-                page_id = tog.get_attribute("data-page-id")
-            except Exception:
-                page_id = None
-
-            if not page_id:
-                try:
-                    span = li.find_element(By.CSS_SELECTOR, ".plugin_pagetree_children_span[id]")
-                    m = re.search(r"childrenspan(\d+)-", span.get_attribute("id") or "")
-                    if m:
-                        page_id = m.group(1)
-                except Exception:
-                    page_id = None
-
-            if not page_id:
-                page_id = parse_page_id_from_url(href)
-            if not page_id:
-                continue
-
-            parent_id = None
-            try:
-                parent_ul = li.find_element(By.XPATH, "ancestor::ul[1]")
-                ul_id = parent_ul.get_attribute("id") or ""
-                m = re.search(r"child_ul(\d+)-", ul_id)
-                if m:
-                    parent_id = m.group(1)
-            except Exception:
-                pass
-
-            results.append((str(page_id), title, parent_id, href))
+            collapsed = bool(driver.execute_script(js_is_collapsed))
+            if not collapsed:
+                if driver.execute_script(js_tree_visible):
+                    return True
+            else:
+                clicked = driver.execute_script(js_expand)
+                if clicked:
+                    time.sleep(0.4)
         except Exception:
-            continue
-    return results
+            pass
+        time.sleep(0.2)
+
+    return False
 
 # =========================
 # Content utils & downloader
@@ -591,10 +827,14 @@ def download_file(url: str, save_dir: str) -> Optional[str]:
     ensure_dir(save_dir)
     file_path = os.path.join(save_dir, filename)
 
+    #print(f"[download_file] url={url} filename={filename} path={file_path}")
+
     if os.path.exists(file_path):
         try:
             local_size = os.path.getsize(file_path)
-            print(f"[Skip] {filename} (already downloaded, {local_size} bytes).")
+            # These two are really annoying, hardcoded out
+            if "batch" not in filename and "colors" not in filename:
+                print(f"[Skip] {filename} (already downloaded, {local_size} bytes).")
             return filename
         except Exception:
             pass
@@ -613,7 +853,9 @@ def download_file(url: str, save_dir: str) -> Optional[str]:
                 for chunk in resp.iter_content(8192):
                     if chunk:
                         f.write(chunk)
-        print(f"[Downloaded] {filename}")
+        # These two are really annoying, hardcoded out
+        if "batch" not in filename and "colors" not in filename:
+            print(f"[Downloaded] {filename}")
         return filename
     except Exception as e:
         print(f"[Error] Downloading {url}: {e}")
@@ -790,6 +1032,8 @@ def save_page_html(node: PageNode,
         if not href:
             print(f"[Skip] No URL known for page {node.id}")
             return False
+        #print(">>> SAVE_PAGE_HTML")
+        # Do allow restarts (test this behavior)
         cid, _, _ = navigate_and_wait(href, 40)
         if cid and cid != node.id:
             print(f"[Info] Page {node.id} resolved to canonical {cid} while saving.")
@@ -935,6 +1179,7 @@ def build_graph_and_titles():
         driver.get(ORIGIN)  # ensure cookies are applied
 
     # 2) Navigate to the start page
+    # Do not allow restart
     driver.get(START_PAGE_URL)
 
     print("[Login] Waiting for successful login or cookie auth...")
@@ -946,10 +1191,13 @@ def build_graph_and_titles():
     print(f"[Login] Success. URL={driver.current_url}")
 
     # Identify start page
-    cid, title, parent = navigate_and_wait(START_PAGE_URL, 45)
+    # Do not allow restart
+    #print(">>> BUILD_GRAPH")
+    cid, title, parent = navigate_and_wait(START_PAGE_URL, 45, False)
     if not cid:
         driver.refresh()
-        cid, title, parent = navigate_and_wait(driver.current_url, 30)
+        #print(">>> BUILD_GRAPH 2")
+        cid, title, parent = navigate_and_wait(driver.current_url, 30, False)
     if not cid:
         cid = parse_page_id_from_url(driver.current_url)
     if not cid:
@@ -968,6 +1216,10 @@ def build_graph_and_titles():
     print("[PageTree] Harvesting...")
     entries = harvest_pagetree_nodes()
     print(f"[PageTree] Found {len(entries)} entries.")
+
+    # Restart driver just for good measure
+    maybe_restart_driver(force=True)
+
     for pid, t, parent_id, href in entries:
         node = GRAPH.get_or_create(pid)
         node.hrefs.add(href)
@@ -993,6 +1245,7 @@ def build_graph_and_titles():
         node = GRAPH.nodes[cur]
         href = next(iter(node.hrefs)) if node.hrefs else f"{BASE_URL}/pages/viewpage.action?pageId={cur}"
         print(f"[Crawl] Visiting id={cur}  title={node.title}  visited={len(visited_ids)}  queue={len(queue)}")
+        # DO allow restarts. This is where most of the issues happen
         cid, t, parent = navigate_and_wait(href, 40)
         if cid and str(cid) != cur:
             cur = str(cid)
@@ -1006,7 +1259,8 @@ def build_graph_and_titles():
             GRAPH.set_parent(cur, None)
 
         extra_links = extract_same_space_links_from_content()
-        print(f"[Crawl]   Extracted {len(extra_links)} in-space links.")
+        if extra_links and len(extra_links) > 0:
+            print(f"[Crawl]   Extracted {len(extra_links)} in-space links.")
         for link in extra_links:
             pid = parse_page_id_from_url(link)
             if pid:
@@ -1016,6 +1270,7 @@ def build_graph_and_titles():
                     queue.append(pid)
             else:
                 try:
+                    #print(">>> LINK")
                     ecid, etitle, eparent = navigate_and_wait(link, 10)
                     if ecid:
                         ecid = str(ecid)
